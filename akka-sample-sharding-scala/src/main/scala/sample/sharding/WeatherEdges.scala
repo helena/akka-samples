@@ -6,6 +6,7 @@ import scala.util.{ Failure, Random, Success }
 import akka.actor.typed.{ ActorRef, ActorSystem, Behavior }
 import akka.actor.typed.scaladsl.{ Behaviors, TimerScheduler }
 import com.typesafe.config.ConfigFactory
+import akka.stream.SystemMaterializer
 
 /** Simulate devices and stations.
  * In the wild, each station would run its own simple system,
@@ -60,35 +61,34 @@ object WeatherHttpApi {
 
   final case class Data(stationId: Int, deviceId: Int, data: List[Double])
 
+  // This formatter determines how to convert to and from Data objects:
+  import spray.json._
+  import spray.json.DefaultJsonProtocol._
+  implicit val dataFormat: RootJsonFormat[Data] = jsonFormat3(Data)
+
   def apply(stationId: Int, port: Int): Behavior[Data] =
     Behaviors.setup[Data] { context =>
       import akka.http.scaladsl.Http
-      import akka.http.scaladsl.model.{ ContentTypes, HttpEntity, HttpMethods, HttpRequest }
 
-      implicit val sys = context.system
       import context.executionContext
       import akka.actor.typed.scaladsl.adapter._
+      import akka.http.scaladsl.unmarshalling.Unmarshal
       val http = Http(context.system.toClassic)
+      implicit val mat: akka.stream.Materializer = SystemMaterializer(context.system.toClassic).materializer
 
-      // Run and completely consume a single akka http request
-      def runRequest(req: HttpRequest) =
-        http.singleRequest(req).flatMap { _.entity.dataBytes.runReduce(_ ++ _) }
+      // This import makes the 'format' above available to the Akka HTTP
+      // marshalling infractructure used when constructing the Post below:
+      import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
+
+      import akka.http.scaladsl.client.RequestBuilding.Post
 
       Behaviors.receiveMessage[Data] {
-        case Data(sid, did, data) =>
-          // TODO marshalling vs scary hand-coded!
-          val values = data.mkString(",")
-          val json = s"""{"stationId":$sid,"deviceId":$did,"data":[$values]}"""
-          context.log.info("Read: {}", json)
-
-          // See https://doc.akka.io/docs/akka-http/current/common/index.html
-          // for marshalling, unmarshalling, json support in the wild.
-          val httpEntity = HttpEntity(ContentTypes.`application/json`, json)
-          runRequest(
-            HttpRequest(method = HttpMethods.POST, uri = s"http://localhost:$port/temperatures", entity = httpEntity))
+        case data: Data =>
+          http.singleRequest(Post(s"http://localhost:$port/temperatures", data))
+            .flatMap(res => Unmarshal(res).to[String])
             .onComplete {
               case Success(response) =>
-                context.log.info(response.utf8String)
+                context.log.info(response)
               case Failure(e) => context.log.error("Something wrong.", e)
             }
 
